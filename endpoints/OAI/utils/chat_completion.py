@@ -50,6 +50,29 @@ from endpoints.OAI.utils.tools import (
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
+def should_add_generation_prompt(data: ChatCompletionRequest) -> bool:
+    """
+    Determines if a generation prompt should be added based on the request.
+    - Explicitly follows `data.add_generation_prompt` if set.
+    - Defaults to `False` if the last message is from the assistant to avoid double prompts.
+    - Defaults to `True` otherwise.
+    """
+    if data.add_generation_prompt is not None:
+        return data.add_generation_prompt
+    if data.messages and data.messages[-1].role == "assistant":
+        return False
+    return True
+
+
+def preprocess_stream_chunk(data: dict, inject_thinking: bool, is_first_chunk: bool):
+    """Prepends '<think>' to the first chunk of a stream if needed."""
+    if inject_thinking and is_first_chunk:
+        updated = data.copy()
+        updated["delta_content"] = "<think>" + (updated.get("delta_content") or "")
+        return updated
+    return data
+
+
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
     """
     Utility function to determine if the formatted prompt indicates that inference should
@@ -104,7 +127,9 @@ def _user_suffix_len(data: ChatCompletionRequest) -> int:
                 len(part.text) for part in content if part.type == "text" and part.text
             )
 
-    if data.response_prefix and (data.add_generation_prompt or data.continue_final_message):
+    if data.response_prefix and (
+        should_add_generation_prompt(data) or data.continue_final_message
+    ):
         suffix_len += len(data.response_prefix)
 
     return suffix_len
@@ -512,12 +537,13 @@ async def apply_chat_template(data: ChatCompletionRequest):
 
     # Locally store tools dict
     tools = data.model_dump()["tools"]
+    add_generation_prompt = should_add_generation_prompt(data)
 
     try:
         data.template_vars = resolve_template_vars(data, model.container)
         data.template_vars.update(
             {
-                "add_generation_prompt": data.add_generation_prompt,
+                "add_generation_prompt": add_generation_prompt,
                 "tools": tools,
                 "functions": data.functions,
             }
@@ -543,7 +569,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
         # Append response prefix if present. With continue_final_message it
         # extends the continued turn.
         if data.response_prefix:
-            if data.add_generation_prompt or data.continue_final_message:
+            if add_generation_prompt or data.continue_final_message:
                 prompt += data.response_prefix
             else:
                 xlogger.warning(
@@ -879,12 +905,18 @@ async def stream_generate_chat_completion(
 
         # Determine if we're streaming content or reasoning_content to start with
         start_in_reasoning_mode = _resolve_start_in_reasoning(prompt, data)
+        inject_thinking = (
+            not start_in_reasoning_mode
+            and "<think>" in prompt[-11:]
+            and should_add_generation_prompt(data)
+        )
 
         # For aggregating usage
         usage_stats_list = []
 
         # Choice indices whose role has been sent
         role_sent = set()
+        seen_first_chunk_indices = set()
 
         # Create a stream collector for each choice
         remaining_n = data.n
@@ -915,36 +947,47 @@ async def stream_generate_chat_completion(
             if isinstance(generation, Exception):
                 raise generation
 
+            is_prefill = "_prefill_progress" in generation
+            index = generation.get("index", 0)
+            is_first_for_this_index = not is_prefill and index not in seen_first_chunk_indices
+
+            processed_generation = preprocess_stream_chunk(
+                generation, inject_thinking, is_first_for_this_index
+            )
+
             # llama-server attaches timings to the stream's last chunk: the usage
             # chunk when include_usage is set, otherwise the chunk carrying
             # finish_reason. Timings describe one generation, so n>1 reports none.
-            timings = get_timings(generation) if data.n == 1 else None
+            timings = get_timings(processed_generation) if data.n == 1 else None
             suppress_finish = return_usage and remaining_n == 1
 
             # Create and serialize chunk
             chunk, chunk_dict, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
-                generation,
+                processed_generation,
                 model_path.name,
                 suppress_finish,
                 None if suppress_finish else timings,
-                include_role=generation.get("index") not in role_sent,
+                include_role=index not in role_sent,
             )
             if not is_empty:
                 if "role" in chunk_dict["choices"][0]["delta"]:
-                    role_sent.add(generation.get("index"))
+                    role_sent.add(index)
                 yield chunk
+
+            if is_first_for_this_index:
+                seen_first_chunk_indices.add(index)
 
             # Send usage chunk on completing last choice
             if finish_reason:
                 remaining_n -= 1
                 if return_usage:
-                    usage_stats_list.append(get_usage_stats(generation))
+                    usage_stats_list.append(get_usage_stats(processed_generation))
                     if remaining_n == 0:
                         usage_chunk, usage_chunk_dict = _compose_serialize_stream_usage_chunk(
                             request.state.id,
                             aggregate_usage_stats(usage_stats_list),
-                            generation["index"],
+                            processed_generation["index"],
                             finish_reason,
                             model_path.name,
                             timings,
@@ -1032,6 +1075,18 @@ async def generate_chat_completion(
             if isinstance(r, Exception):
                 raise r
             generations.append(r)
+
+        # Prepend "<think>" after generation and tool calls are complete
+        # when native reasoning_content splitting is not active.
+        if (
+            not start_in_reasoning_mode
+            and "<think>" in prompt[-11:]
+            and should_add_generation_prompt(data)
+        ):
+            for gen in generations:
+                if gen.get("content") is not None:
+                    gen["content"] = "<think>" + gen["content"]
+
         response = _compose_response(request.state.id, generations, model_path.name, return_usage)
 
         xlogger.debug(f"{request_tag(request)} chat completion finished", {"response": response})
